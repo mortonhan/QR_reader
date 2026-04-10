@@ -19,6 +19,7 @@ import { parseImageFileQRCodes, parsePdfFileQRCodes } from "@/lib/qr/client";
 
 type Row = QrParseResult & {
   content: string;
+  fileName: string;
 };
 
 function isProbablyUrl(text: string) {
@@ -118,10 +119,14 @@ export default function Home() {
       try {
         const baseRows: Row[] = [];
 
-        const appendRows = (incoming: QrParseResult[]) => {
+        const appendRows = (incoming: QrParseResult[], sourceFile: File) => {
           const mapped = incoming.map((r) => ({
             ...r,
             content: isProbablyUrl(r.text) ? "正在获取正文..." : "（非 URL）",
+            fileName:
+              r.sourceType === "pdf"
+                ? `${sourceFile.name.replace(/\.pdf$/i, "")}-p${String(r.pageNumber).padStart(3, "0")}.jpg`
+                : sourceFile.webkitRelativePath || sourceFile.name,
           }));
           baseRows.push(...mapped);
           setRows([...baseRows]);
@@ -132,7 +137,7 @@ export default function Home() {
             setStatus(`正在读取 PDF：${file.name}`);
             await parsePdfFileQRCodes(file, {
               onProgress: (p) => setStatus(p),
-              onPageResults: (rows) => appendRows(rows),
+              onPageResults: (rows) => appendRows(rows, file),
             });
           } else {
             setStatus(`正在解析图片：${file.name}`);
@@ -140,7 +145,7 @@ export default function Home() {
             const imagePreviewUrl = URL.createObjectURL(file);
             objectUrlsRef.current.push(imagePreviewUrl);
             const withPreview = r.map((item) => ({ ...item, previewUrl: imagePreviewUrl }));
-            appendRows(withPreview);
+            appendRows(withPreview, file);
           }
         }
         await resolveContentsInPlace([...baseRows]);
@@ -210,7 +215,7 @@ export default function Home() {
         r.sourceType === "pdf"
           ? `${r.pageLabel}`
           : `${String(r.index).padStart(2, "0")}`;
-      return `${left}\t${r.text}\t${r.content}`;
+      return `${r.fileName}\t${left}\t${r.text}\t${r.content}`;
     });
     await navigator.clipboard.writeText(lines.join("\n"));
     setCopied(true);
@@ -219,11 +224,11 @@ export default function Home() {
 
   const onExportCsv = useCallback(() => {
     const header = hasPdf
-      ? ["页码及位置", "二维码链接", "正文摘要"]
-      : ["序号", "二维码链接", "正文摘要"];
+      ? ["文件名", "页码及位置", "二维码链接", "正文摘要"]
+      : ["文件名", "序号", "二维码链接", "正文摘要"];
     const body = rows.map((r) => {
       const left = r.sourceType === "pdf" ? r.pageLabel : String(r.index);
-      return [left, r.text, r.content].map(csvEscape).join(",");
+      return [r.fileName, left, r.text, r.content].map(csvEscape).join(",");
     });
     const csv = [header.map(csvEscape).join(","), ...body].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -356,6 +361,7 @@ export default function Home() {
               <table className="w-full text-left text-sm">
                 <thead className="bg-zinc-50 text-xs text-zinc-600">
                   <tr className="border-b border-zinc-200">
+                    <th className="px-4 py-3 font-medium">文件名</th>
                     <th className="whitespace-nowrap px-4 py-3 font-medium">
                       {hasPdf ? "页码及位置" : "序号"}
                     </th>
@@ -367,7 +373,7 @@ export default function Home() {
                   {rows.length === 0 ? (
                     <tr>
                       <td
-                        colSpan={3}
+                        colSpan={4}
                         className="px-4 py-10 text-center text-zinc-500"
                       >
                         暂无结果。请上传图片或 PDF 开始识别。
@@ -379,6 +385,9 @@ export default function Home() {
                         key={`${r.sourceType}-${r.pageLabel}-${i}-${r.text}`}
                         className="border-b border-zinc-100 last:border-0"
                       >
+                        <td className="max-w-[320px] px-4 py-3 text-zinc-700">
+                          <span className="break-all">{r.fileName}</span>
+                        </td>
                         <td className="whitespace-nowrap px-4 py-3 text-zinc-700">
                           <div className="flex items-center gap-2">
                             {r.sourceType === "pdf" ? (

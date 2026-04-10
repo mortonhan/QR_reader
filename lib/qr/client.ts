@@ -297,14 +297,6 @@ function upscaleCanvas(source: HTMLCanvasElement, ratio: number) {
   return canvas;
 }
 
-async function canvasToJpegFile(canvas: HTMLCanvasElement, name: string) {
-  const blob = await new Promise<Blob | null>((resolve) =>
-    canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95)
-  );
-  if (!blob) return null;
-  return new File([blob], name, { type: "image/jpeg" });
-}
-
 async function fileToImageBitmap(file: File) {
   // createImageBitmap 在现代浏览器性能更好
   const blob = file.slice(0, file.size, file.type);
@@ -356,48 +348,145 @@ export async function parsePdfFileQRCodes(
   const onProgress = options?.onProgress;
   const onPageResults = options?.onPageResults;
   const maxPerPage = options?.maxPerPage ?? 12;
-  onProgress?.("正在上传 PDF 到服务端解析...");
-
-  const form = new FormData();
-  form.append("file", file, file.name || "upload.pdf");
-
-  const res = await fetch("/api/parse-pdf", {
-    method: "POST",
-    body: form,
-  });
-  if (!res.ok) {
-    onProgress?.("PDF 解析失败");
-    return [];
+  // 优先走“异步任务”接口，避免大 PDF 请求超时导致页面无响应
+  try {
+    onProgress?.("正在创建 PDF 异步任务...");
+    const form = new FormData();
+    form.append("file", file, file.name || "upload.pdf");
+    const createRes = await fetch("/api/pdf-task", {
+      method: "POST",
+      body: form,
+    });
+    if (createRes.ok) {
+      const createData = (await createRes.json()) as { taskId?: string };
+      const taskId = createData.taskId;
+      if (taskId) {
+        const started = Date.now();
+        while (Date.now() - started < 15 * 60 * 1000) {
+          await sleep(1200);
+          const statusRes = await fetch(`/api/pdf-task/${taskId}`, { method: "GET" });
+          if (!statusRes.ok) break;
+          const statusData = (await statusRes.json()) as {
+            status: "queued" | "processing" | "done" | "failed";
+            progress?: string;
+            error?: string;
+            result?: {
+              results?: Array<{
+                pageNumber: number;
+                indexInPage: number;
+                text: string;
+                positionLabel: string;
+              }>;
+              pagePreviews?: Record<string, string>;
+            };
+          };
+          onProgress?.(statusData.progress || "正在处理 PDF 任务...");
+          if (statusData.status === "failed") {
+            throw new Error(statusData.error || "异步任务失败");
+          }
+          if (statusData.status === "done") {
+            const pagePreviews = statusData.result?.pagePreviews ?? {};
+            const rows = (statusData.result?.results ?? [])
+              .filter((r) => (r.text ?? "").trim().length > 0)
+              .map((r) => {
+                const indexInPage = r.indexInPage > maxPerPage ? maxPerPage : r.indexInPage;
+                const row: QrParseResult = {
+                  sourceType: "pdf",
+                  pageNumber: r.pageNumber,
+                  indexInPage,
+                  pageLabel: `第${r.pageNumber}页-第${indexInPage}个（${r.positionLabel || "未知"}）`,
+                  text: r.text.trim(),
+                  positionLabel: r.positionLabel || "未知",
+                  previewUrl: pagePreviews[String(r.pageNumber)],
+                };
+                return row;
+              });
+            if (rows.length > 0) onPageResults?.(rows);
+            onProgress?.("PDF 解析完成");
+            return rows;
+          }
+        }
+        throw new Error("异步任务超时");
+      }
+    }
+  } catch {
+    // 异步任务不可用时，回退到前端本地解析
+    onProgress?.("异步任务不可用，切换本地解析...");
   }
 
-  const data = (await res.json()) as {
-    results?: Array<{
-      pageNumber: number;
-      indexInPage: number;
-      text: string;
-      positionLabel: string;
-    }>;
-    pagePreviews?: Record<string, string>;
-  };
-  const pagePreviews = data.pagePreviews ?? {};
-  const rows = (data.results ?? [])
-    .filter((r) => (r.text ?? "").trim().length > 0)
-    .map((r) => {
-      const indexInPage = r.indexInPage > maxPerPage ? maxPerPage : r.indexInPage;
+  const pdfScale = options?.pdfScale ?? 2.8;
+
+  await ensurePdfWorker();
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+
+  const buffer = await file.arrayBuffer();
+  const loadingTask = (pdfjsLib as any).getDocument({
+    data: buffer,
+    // 为兼容部分浏览器环境，避免渲染阶段“图像未就绪”导致的异常
+    isImageDecoderSupported: false,
+  });
+  const pdf = await loadingTask.promise;
+
+  const all: QrParseResult[] = [];
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+    onProgress?.(`正在解析 PDF 第 ${pageNumber}/${pdf.numPages} 页...`);
+    const page = await pdf.getPage(pageNumber);
+    const scalesToTry = [pdfScale, 3.4];
+    let pagePreview = "";
+    let multi: Awaited<ReturnType<typeof scanCanvasForMultipleQRCodes>> = [];
+
+    for (const scale of scalesToTry) {
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.floor(viewport.width);
+      canvas.height = Math.floor(viewport.height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) continue;
+
+      await page.render({
+        canvasContext: ctx,
+        viewport,
+      }).promise;
+      await sleep(40);
+      if (!pagePreview) pagePreview = canvas.toDataURL("image/jpeg", 0.86);
+
+      multi = await scanCanvasForMultipleQRCodes(canvas, {
+        maxCount: maxPerPage,
+        fastMode: true,
+      });
+      if (multi.length === 0) {
+        const x15 = upscaleCanvas(canvas, 1.5);
+        multi = await scanCanvasForMultipleQRCodes(x15, {
+          maxCount: maxPerPage,
+          fastMode: true,
+        });
+      }
+      if (multi.length > 0) break;
+    }
+
+    if (multi.length === 0) {
+      onProgress?.(`第 ${pageNumber} 页未识别到二维码，已跳过`);
+      continue;
+    }
+
+    const pageRows = multi.slice(0, maxPerPage).map((r, idx) => {
+      const indexInPage = idx + 1;
       const row: QrParseResult = {
         sourceType: "pdf",
-        pageNumber: r.pageNumber,
+        pageNumber,
         indexInPage,
-        pageLabel: `第${r.pageNumber}页-第${indexInPage}个（${r.positionLabel || "未知"}）`,
-        text: r.text.trim(),
+        pageLabel: `第${pageNumber}页-第${indexInPage}个（${r.positionLabel || "未知"}）`,
+        text: r.text,
         positionLabel: r.positionLabel || "未知",
-        previewUrl: pagePreviews[String(r.pageNumber)],
+        previewUrl: pagePreview,
       };
       return row;
     });
+    all.push(...pageRows);
+    onPageResults?.(pageRows);
+  }
 
-  if (rows.length > 0) onPageResults?.(rows);
-  onProgress?.("PDF 解析完成，正在整理结果...");
-  return rows;
+  onProgress?.("PDF 解析完成");
+  return all;
 }
 
