@@ -24,6 +24,7 @@ export type QrParseResult =
 
 type ProgressOptions = {
   onProgress?: (message: string) => void;
+  onPageResults?: (rows: QrParseResult[]) => void;
   // 为了避免死循环或极端情况下过慢，限制每一页最多识别多少个二维码
   maxPerPage?: number;
   // PDF 渲染缩放倍数（越大越清晰，但越慢）
@@ -117,11 +118,12 @@ function maskFoundQrOnCanvas(
   ctx.restore();
 }
 
-function scanCanvasForMultipleQRCodes(
+async function scanCanvasForMultipleQRCodes(
   canvas: HTMLCanvasElement,
-  opts?: { maxCount?: number }
+  opts?: { maxCount?: number; fastMode?: boolean }
 ) {
   const maxCount = opts?.maxCount ?? 12;
+  const fastMode = opts?.fastMode ?? false;
   const ctx = canvas.getContext("2d");
   if (!ctx) return [];
 
@@ -136,22 +138,142 @@ function scanCanvasForMultipleQRCodes(
     positionLabel: string;
   }> = [];
 
-  // 为了“多二维码识别”，我们采用一个简单可理解的策略：
+  const tryDecode = (imageData: ImageData) =>
+    jsQR(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: "attemptBoth",
+    });
+
+  const toBinary = (imageData: ImageData, threshold: number) => {
+    const d = new Uint8ClampedArray(imageData.data);
+    for (let i = 0; i < d.length; i += 4) {
+      const gray = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+      const v = gray >= threshold ? 255 : 0;
+      d[i] = v;
+      d[i + 1] = v;
+      d[i + 2] = v;
+      d[i + 3] = 255;
+    }
+    return new ImageData(d, imageData.width, imageData.height);
+  };
+
+  const tryDecodeWithPreprocess = (imageData: ImageData) => {
+    const direct = tryDecode(imageData);
+    if (direct) return direct;
+    if (fastMode) return null;
+    // 对“发灰/压缩”的 PDF 图像做多阈值二值化兜底
+    const thresholds = [90, 110, 128, 150, 170];
+    for (const t of thresholds) {
+      const code = tryDecode(toBinary(imageData, t));
+      if (code) return code;
+    }
+    return null;
+  };
+
+  // 先使用 jsQR 多次扫描（每次抹除一个已识别区域）
   // 每次 jsQR 识别出一个二维码后，把该区域涂白，再继续识别下一条。
   for (let i = 0; i < maxCount; i++) {
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const code = jsQR(imageData.data, imageData.width, imageData.height, {
-      inversionAttempts: "attemptBoth",
-    });
+    let code = tryDecodeWithPreprocess(imageData);
+
+    // 若整页扫描失败，再尝试“宫格分块”扫描，适配二维码很小或在边角的情况
+    if (!code && !fastMode) {
+      const gridSizes = [2, 3];
+      for (const grid of gridSizes) {
+        const tileW = Math.floor(canvas.width / grid);
+        const tileH = Math.floor(canvas.height / grid);
+        for (let gy = 0; gy < grid; gy++) {
+          for (let gx = 0; gx < grid; gx++) {
+            const sx = gx * tileW;
+            const sy = gy * tileH;
+            const sw = gx === grid - 1 ? canvas.width - sx : tileW;
+            const sh = gy === grid - 1 ? canvas.height - sy : tileH;
+            if (sw < 40 || sh < 40) continue;
+            const tile = ctx.getImageData(sx, sy, sw, sh);
+            const found = tryDecodeWithPreprocess(tile);
+            if (found) {
+              // 把分块坐标转换回整页坐标
+              code = {
+                ...found,
+                location: {
+                  topLeftCorner: {
+                    x: found.location.topLeftCorner.x + sx,
+                    y: found.location.topLeftCorner.y + sy,
+                  },
+                  topRightCorner: {
+                    x: found.location.topRightCorner.x + sx,
+                    y: found.location.topRightCorner.y + sy,
+                  },
+                  bottomLeftCorner: {
+                    x: found.location.bottomLeftCorner.x + sx,
+                    y: found.location.bottomLeftCorner.y + sy,
+                  },
+                  bottomRightCorner: {
+                    x: found.location.bottomRightCorner.x + sx,
+                    y: found.location.bottomRightCorner.y + sy,
+                  },
+                },
+              } as typeof found;
+              break;
+            }
+          }
+          if (code) break;
+        }
+        if (code) break;
+      }
+    }
+
     if (!code) break;
 
     const pos = getPositionLabelByLocation(canvas.width, canvas.height, code.location);
+    const text = (code.data ?? "").trim();
+    if (!text) {
+      // 避免卡在同一处“空数据误识别”
+      maskFoundQrOnCanvas(ctx, code.location);
+      continue;
+    }
     results.push({
-      text: code.data,
+      text,
       location: code.location,
       positionLabel: pos,
     });
     maskFoundQrOnCanvas(ctx, code.location);
+  }
+
+  // 若 jsQR 为空，则使用浏览器原生 BarcodeDetector 兜底。
+  // 这在部分 PDF 渲染图上识别率更高。
+  if (
+    results.length === 0 &&
+    "BarcodeDetector" in globalThis &&
+    typeof (globalThis as any).BarcodeDetector === "function"
+  ) {
+    try {
+      const detector = new (globalThis as any).BarcodeDetector({
+        formats: ["qr_code"],
+      });
+      const barcodes: Array<{
+        rawValue?: string;
+        cornerPoints?: Array<{ x: number; y: number }>;
+      }> = await detector.detect(canvas);
+
+      for (const b of barcodes) {
+        const text = (b.rawValue ?? "").trim();
+        const corners = b.cornerPoints ?? [];
+        if (!text || corners.length < 4) continue;
+        const location = {
+          topLeftCorner: { x: corners[0].x, y: corners[0].y },
+          topRightCorner: { x: corners[1].x, y: corners[1].y },
+          bottomRightCorner: { x: corners[2].x, y: corners[2].y },
+          bottomLeftCorner: { x: corners[3].x, y: corners[3].y },
+        };
+        results.push({
+          text,
+          location,
+          positionLabel: getPositionLabelByLocation(canvas.width, canvas.height, location),
+        });
+      }
+    } catch {
+      // 忽略原生识别失败，继续走后续兜底
+    }
   }
 
   // 去重（有时会出现重复识别）
@@ -175,6 +297,14 @@ function upscaleCanvas(source: HTMLCanvasElement, ratio: number) {
   return canvas;
 }
 
+async function canvasToJpegFile(canvas: HTMLCanvasElement, name: string) {
+  const blob = await new Promise<Blob | null>((resolve) =>
+    canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95)
+  );
+  if (!blob) return null;
+  return new File([blob], name, { type: "image/jpeg" });
+}
+
 async function fileToImageBitmap(file: File) {
   // createImageBitmap 在现代浏览器性能更好
   const blob = file.slice(0, file.size, file.type);
@@ -190,7 +320,7 @@ export async function parseImageFileQRCodes(file: File): Promise<QrParseResult[]
   if (!ctx) return [];
   ctx.drawImage(bmp, 0, 0);
 
-  const multi = scanCanvasForMultipleQRCodes(canvas, { maxCount: 12 });
+  const multi = await scanCanvasForMultipleQRCodes(canvas, { maxCount: 12 });
   if (multi.length === 0) return [];
 
   return multi.map((m, idx) => ({
@@ -224,74 +354,50 @@ export async function parsePdfFileQRCodes(
   options?: ProgressOptions
 ): Promise<QrParseResult[]> {
   const onProgress = options?.onProgress;
+  const onPageResults = options?.onPageResults;
   const maxPerPage = options?.maxPerPage ?? 12;
-  const pdfScale = options?.pdfScale ?? 2;
+  onProgress?.("正在上传 PDF 到服务端解析...");
 
-  await ensurePdfWorker();
-  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const form = new FormData();
+  form.append("file", file, file.name || "upload.pdf");
 
-  const buffer = await file.arrayBuffer();
-  const loadingTask = (pdfjsLib as any).getDocument({
-    data: buffer,
-    // 某些浏览器 + PDF 组合下，ImageDecoder 路径可能导致图像还没就绪就被读取
-    // 关闭后更稳定（代价是略慢一点）。
-    isImageDecoderSupported: false,
+  const res = await fetch("/api/parse-pdf", {
+    method: "POST",
+    body: form,
   });
-  const pdf = await loadingTask.promise;
-
-  const all: QrParseResult[] = [];
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
-    onProgress?.(`正在解析 PDF 第 ${pageNumber} 页...`);
-    const page = await pdf.getPage(pageNumber);
-    const viewport = page.getViewport({ scale: pdfScale });
-
-    // 离屏 canvas：不需要渲染到页面上
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
-    const ctx = canvas.getContext("2d");
-    if (!ctx) continue;
-
-    await page.render({
-      canvasContext: ctx,
-      viewport,
-    }).promise;
-    // 让异步图片依赖有一点时间落盘到 canvas，减少 “Dependent image isn't ready yet”
-    await sleep(80);
-    const pagePreviewUrl = canvas.toDataURL("image/png");
-
-    let multi = scanCanvasForMultipleQRCodes(canvas, { maxCount: maxPerPage });
-    // 兜底：当二维码很小或页面分辨率不够时，放大后再扫一次
-    if (multi.length === 0) {
-      const x15 = upscaleCanvas(canvas, 1.5);
-      multi = scanCanvasForMultipleQRCodes(x15, { maxCount: maxPerPage });
-    }
-    if (multi.length === 0) {
-      const x2 = upscaleCanvas(canvas, 2);
-      multi = scanCanvasForMultipleQRCodes(x2, { maxCount: maxPerPage });
-    }
-
-    if (multi.length === 0) {
-      onProgress?.(`第 ${pageNumber} 页未识别到二维码，继续下一页...`);
-      continue;
-    }
-
-    multi.forEach((m, idx) => {
-      const indexInPage = idx + 1;
-      const pageLabel = `第${pageNumber}页-第${indexInPage}个（${m.positionLabel}）`;
-      all.push({
-        sourceType: "pdf",
-        pageNumber,
-        indexInPage,
-        pageLabel,
-        text: m.text,
-        positionLabel: m.positionLabel,
-        previewUrl: pagePreviewUrl,
-      });
-    });
+  if (!res.ok) {
+    onProgress?.("PDF 解析失败");
+    return [];
   }
 
+  const data = (await res.json()) as {
+    results?: Array<{
+      pageNumber: number;
+      indexInPage: number;
+      text: string;
+      positionLabel: string;
+    }>;
+    pagePreviews?: Record<string, string>;
+  };
+  const pagePreviews = data.pagePreviews ?? {};
+  const rows = (data.results ?? [])
+    .filter((r) => (r.text ?? "").trim().length > 0)
+    .map((r) => {
+      const indexInPage = r.indexInPage > maxPerPage ? maxPerPage : r.indexInPage;
+      const row: QrParseResult = {
+        sourceType: "pdf",
+        pageNumber: r.pageNumber,
+        indexInPage,
+        pageLabel: `第${r.pageNumber}页-第${indexInPage}个（${r.positionLabel || "未知"}）`,
+        text: r.text.trim(),
+        positionLabel: r.positionLabel || "未知",
+        previewUrl: pagePreviews[String(r.pageNumber)],
+      };
+      return row;
+    });
+
+  if (rows.length > 0) onPageResults?.(rows);
   onProgress?.("PDF 解析完成，正在整理结果...");
-  return all;
+  return rows;
 }
 

@@ -36,6 +36,27 @@ function csvEscape(value: string) {
   return v;
 }
 
+function isSupportedUploadFile(file: File) {
+  const name = (file.name || "").toLowerCase();
+  const type = (file.type || "").toLowerCase();
+  const byName =
+    name.endsWith(".pdf") ||
+    name.endsWith(".png") ||
+    name.endsWith(".jpg") ||
+    name.endsWith(".jpeg");
+  const byType =
+    type === "application/pdf" ||
+    type === "image/png" ||
+    type === "image/jpeg";
+  return byName || byType;
+}
+
+function isPdfFile(file: File) {
+  const name = (file.name || "").toLowerCase();
+  const type = (file.type || "").toLowerCase();
+  return name.endsWith(".pdf") || type === "application/pdf";
+}
+
 export default function Home() {
   const [rows, setRows] = useState<Row[]>([]);
   const [busy, setBusy] = useState(false);
@@ -86,15 +107,7 @@ export default function Home() {
 
   const handleFiles = useCallback(
     async (files: File[]) => {
-      const accepted = files.filter((f) => {
-        const name = f.name.toLowerCase();
-        return (
-          name.endsWith(".pdf") ||
-          name.endsWith(".png") ||
-          name.endsWith(".jpg") ||
-          name.endsWith(".jpeg")
-        );
-      });
+      const accepted = files.filter((f) => isSupportedUploadFile(f));
       if (accepted.length === 0) return;
 
       setBusy(true);
@@ -103,31 +116,34 @@ export default function Home() {
       clearObjectUrls();
       setRows([]);
       try {
-        const parsed: QrParseResult[] = [];
+        const baseRows: Row[] = [];
+
+        const appendRows = (incoming: QrParseResult[]) => {
+          const mapped = incoming.map((r) => ({
+            ...r,
+            content: isProbablyUrl(r.text) ? "正在获取正文..." : "（非 URL）",
+          }));
+          baseRows.push(...mapped);
+          setRows([...baseRows]);
+        };
 
         for (const file of accepted) {
-          if (file.name.toLowerCase().endsWith(".pdf")) {
+          if (isPdfFile(file)) {
             setStatus(`正在读取 PDF：${file.name}`);
-            const r = await parsePdfFileQRCodes(file, {
+            await parsePdfFileQRCodes(file, {
               onProgress: (p) => setStatus(p),
+              onPageResults: (rows) => appendRows(rows),
             });
-            parsed.push(...r);
           } else {
             setStatus(`正在解析图片：${file.name}`);
             const r = await parseImageFileQRCodes(file);
             const imagePreviewUrl = URL.createObjectURL(file);
             objectUrlsRef.current.push(imagePreviewUrl);
-            parsed.push(...r.map((item) => ({ ...item, previewUrl: imagePreviewUrl })));
+            const withPreview = r.map((item) => ({ ...item, previewUrl: imagePreviewUrl }));
+            appendRows(withPreview);
           }
         }
-
-        const baseRows: Row[] = parsed.map((r) => ({
-          ...r,
-          content: isProbablyUrl(r.text) ? "正在获取正文..." : "（非 URL）",
-        }));
-        setRows(baseRows);
-
-        await resolveContentsInPlace(baseRows);
+        await resolveContentsInPlace([...baseRows]);
       } finally {
         setBusy(false);
         setStatus("");
@@ -157,16 +173,26 @@ export default function Home() {
 
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
-      const items = e.clipboardData?.items ?? [];
+      const clipboard = e.clipboardData;
       const files: File[] = [];
+      if (clipboard?.files?.length) {
+        files.push(...Array.from(clipboard.files));
+      }
+      const items = clipboard?.items ?? [];
       for (const item of items) {
         if (item.kind !== "file") continue;
         const f = item.getAsFile();
         if (f) files.push(f);
       }
-      if (files.length === 0) return;
+      const accepted = files.filter((f) => isSupportedUploadFile(f));
+      // 去重：避免 files + items 同时拿到同一文件导致重复解析
+      const uniq = accepted.filter(
+        (f, i, arr) =>
+          arr.findIndex((x) => x.name === f.name && x.size === f.size && x.type === f.type) === i
+      );
+      if (uniq.length === 0) return;
       e.preventDefault();
-      void handleFiles(files);
+      void handleFiles(uniq);
       if (pasteHintTimer.current) window.clearTimeout(pasteHintTimer.current);
       pasteHintTimer.current = window.setTimeout(() => setCopied(false), 800);
     };
